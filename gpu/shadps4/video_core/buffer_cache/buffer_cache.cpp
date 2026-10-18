@@ -36,6 +36,22 @@ namespace VideoCore {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
+/// sotc: SOTC_RB_NARROW=<KiB> (power of two, 4-512; 1 or unset = 64 KiB): the readback window,
+/// in bytes; 0 keeps the 512 KiB one (Shrine: 46.0 FPS at 512 KiB, 47.9-48.8 at 64, 47.5 at 128,
+/// 42.9 at 32, where the readbacks double). A readback unprotects every GPU-written page of its
+/// window and the next GPU writes of those pages protect them again one binding at a time (most of
+/// the draw thread's VirtualProtect calls), every frame; a smaller window leaves the pages the
+/// guest does not read protected and GPU-modified. Read once, at static initialisation (no
+/// function-local guard in the fault paths); BufferCache::rb_narrow_window applies it.
+static const u64 rb_narrow_env = [] {
+    const char* v = std::getenv("SOTC_RB_NARROW");
+    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 1;
+    if (kib == 0) {
+        return u64{0};
+    }
+    return std::bit_floor(kib == 1 ? u64{64} : std::clamp<u64>(kib, 4, 512)) * 1_KB;
+}();
+
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
     vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
@@ -90,6 +106,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         static_cast<u16*>(std::calloc(blocks_per_arena_page * NUM_ARENA_PAGES, sizeof(u16)));
     ASSERT_MSG(block_last_use, "No memory for the arena block use table");
     epoch_start = std::chrono::steady_clock::now();
+    // sotc: SOTC_RB_NARROW only in the precise readback mode, where every GPU-modified page is
+    // read-protected: the relaxed mode reads back only on write faults, and the wide window is
+    // all that refreshes the data around them.
+    if (rb_narrow_env && memory_tracker->ReadbacksMode() == GpuReadbacksMode::Precise) {
+        rb_narrow_window = rb_narrow_env;
+        SotcStats::rb_narrow_kib.store(rb_narrow_window / 1_KB, std::memory_order_relaxed);
+    }
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
@@ -139,7 +162,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
     liverpool->SendCommand<true>([this, device_addr, size] {
-        gpu_modified_ranges.Subtract(device_addr, size);
+        {
+            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         MarkInflightReadbacksDirty(device_addr, size);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -158,21 +184,49 @@ void BufferCache::MarkWriteAhead(VAddr addr) {
     memory_tracker->MarkAheadAsCpuModified(next_page, ahead);
 }
 
+std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(const Buffer* arena, VAddr device_addr,
+                                                    u64 size) {
+    // GPU-modified ranges come as many small scattered islands,
+    // so the download is widened to a window around the request
+    constexpr u64 WindowSize = 512_KB;
+    const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+    const auto window = [&](u64 window_size) {
+        const VAddr start =
+            std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
+        const VAddr end =
+            std::min<VAddr>(std::max<VAddr>(start + window_size, device_addr + size), arena_end);
+        return std::pair<VAddr, VAddr>{start, end};
+    };
+    if (rb_narrow_window == 0) {
+        return window(WindowSize);
+    }
+    // sotc: SOTC_RB_NARROW. The window is the aligned granule (or granules) of the request, so
+    // the same reads ask for the same window every frame and the hot readbacks (GatherDownloads)
+    // bring the other granules the guest reads along with the first readback, as the wide window
+    // did. Everything the guest reads is still downloaded: a page outside the window keeps its
+    // GPU bit and read protection, and its own fault reads it back.
+    const auto narrow = window(rb_narrow_window);
+    if (SotcStats::kFpsLog) {
+        // The narrow window lies inside the wide one (both power-of-two aligned around the request,
+        // clipped to the same arena): count what the wide one would also have taken.
+        const auto wide = window(WindowSize);
+        const VAddr narrow_end =
+            std::min<VAddr>(Common::AlignUp(narrow.second, BYTES_PER_PAGE), wide.second);
+        const u64 kept =
+            memory_tracker->CountGpuModifiedPages(wide.first, narrow.first - wide.first) +
+            memory_tracker->CountGpuModifiedPages(narrow_end, wide.second - narrow_end);
+        SotcStats::rb_narrow_kept_bytes.fetch_add(kept * BYTES_PER_PAGE, std::memory_order_relaxed);
+    }
+    return narrow;
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
         NoteHotRead(device_addr, size);
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
-
-        // GPU-modified ranges come as many small scattered islands,
-        // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
-        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
-        const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        const auto [window_start, window_end] = ReadbackWindow(arena, device_addr, size);
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
@@ -183,13 +237,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
-    // sotc: asynchronous readbacks by default (SOTC_RB_ASYNC=0: the command processor waits).
-    // With mip tails freeing video memory, 4 attract runs showed no collapse (the one seen on
-    // 2026-10-15 ran over budget): 48.7-48.8 vs 46.6-48.2 FPS, frames over 50 ms 66-81 vs
-    // 100-112, readback time in slow frames ~0.2 s vs ~1 s; shrine 29.2 -> 30.7 FPS.
-    static const bool async = [] {
+    // sotc: SOTC_RB_ASYNC=1: with the draw thread (Liverpool::IsBackThreaded) the synchronous
+    // readback holds it while the GPU catches up (~10% of its time; Shrine 38.9 -> 40.6 fps). Off
+    // by default: the attract demo of another branch (DUDUYG, PR 69) and one boot of this one
+    // stopped on the page_manager.cpp "protect region as write-only" assertion with it.
+    static const bool async = [this] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return !v || v[0] != '0';
+        return v && v[0] == '1';
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));
@@ -232,13 +286,8 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
     const u32 first_block = readback.device_addr >> block_shift;
     const u32 last_block = (readback.device_addr + readback.size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
-    constexpr u64 WindowSize = 512_KB;
-    const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-    const VAddr window_start =
-        std::max<VAddr>(Common::AlignDown(readback.device_addr, WindowSize), arena->cpu_addr);
-    const VAddr window_end = std::min<VAddr>(
-        std::max<VAddr>(window_start + WindowSize, readback.device_addr + readback.size),
-        arena_end);
+    const auto [window_start, window_end] =
+        ReadbackWindow(arena, readback.device_addr, readback.size);
     readback.arena = arena;
     readback.window_start = window_start;
     readback.window_size = window_end - window_start;
@@ -338,6 +387,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     } else {
         download.buffer->Invalidate(download.offset, download.size);
         for (const auto& item : readback.pending) {
+            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
             for (const auto& [address, range_size] : item.gpu_ranges) {
                 gpu_modified_ranges.Subtract(address, range_size);
             }
@@ -475,13 +525,21 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
             }
             regions.push_back({hot_arena, hot.addr, hot.size});
         }
+        // sotc: SOTC_RB_NARROW: the reads one wide window covered ask for several narrow ones;
+        // room for up to 4 times as many.
+        const size_t max_hot =
+            rb_narrow_window ? MaxHotReadbacks * std::min<u64>(4, 512_KB / rb_narrow_window)
+                             : MaxHotReadbacks;
         if (!known) {
-            if (hot_readbacks.size() < MaxHotReadbacks) {
+            if (hot_readbacks.size() < max_hot) {
                 hot_readbacks.push_back({device_addr, size, now});
             } else {
                 auto oldest = std::ranges::min_element(hot_readbacks, {}, &HotReadback::last_request);
                 *oldest = {device_addr, size, now};
             }
+        }
+        if (rb_narrow_window && SotcStats::kFpsLog) {
+            SotcStats::rb_hot_entries.store(hot_readbacks.size(), std::memory_order_relaxed);
         }
     }
 
@@ -514,6 +572,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                 };
                 gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
                 if (subtract) {
+                    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
                     gpu_modified_ranges.Subtract(address, range_size);
                 } else {
                     item.gpu_ranges.emplace_back(address, range_size);
@@ -681,7 +740,11 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size) {
         const char* v = std::getenv("SOTC_GPUMOD_NOGROW_SKIP");
         return !v || v[0] != '0';
     }();
-    const bool grew = gpu_modified_ranges.Add(addr, size);
+    bool grew;
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        grew = gpu_modified_ranges.Add(addr, size);
+    }
     if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return;
     }
@@ -709,6 +772,20 @@ bool BufferCache::ReadClean(VAddr addr, void* out, u32 size) {
     const VAddr page_addr = addr & ~(CleanPageSize - 1);
     if (addr + size > page_addr + CleanPageSize) {
         return false;
+    }
+    // sotc: the command processor while the draw thread owns the GPU state: no page cache (the
+    // draw thread maintains it), the ranges under the lock.
+    if (liverpool->RunsGpuWorkElsewhere()) {
+        const u8* backing = memory->GetBackingPointer(page_addr);
+        if (!backing) {
+            return false;
+        }
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        if (gpu_modified_ranges.Intersects(addr, size)) {
+            return false;
+        }
+        std::memcpy(out, backing + (addr - page_addr), size);
+        return true;
     }
     const u64 generation = clean_map_generation.load(std::memory_order_acquire);
     auto& page = clean_pages[(addr >> CleanPageBits) % NumCleanPages];
@@ -806,7 +883,10 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     if (foreign) {
         return false;
     }
-    gpu_modified_ranges.Subtract(addr, size);
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -907,15 +987,56 @@ void BufferCache::SynchronizeDmaBuffers() {
                 }
                 dma_runs.emplace_back(device_addr, size);
             }
+            dma_full_pending = true;
         }
-        // sotc: by index with a copied entry, re-reading size(): nothing nested in
-        // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
-        for (size_t i = 0; i < dma_runs.size(); ++i) {
-            const auto [device_addr, size] = dma_runs[i];
-            SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
-                              static_cast<u32>(size), false, false);
+        // sotc: incremental sweep (SOTC_DMA_INCR=0: every run, every time). Only the 256 KiB
+        // words where a CPU bit rose since the last sweep can need an upload
+        // (RegionManager::TakeSweepWords; hot pages kept by FaultGrace are marked again on each
+        // upload). After the runs change (pages that became resident may hold old CPU bits) one
+        // full sweep restores that. Each run is still synced once, over the hull of its dirty
+        // words, so the uploads per run stay as before.
+        static const bool dma_incr = [] {
+            const char* v = std::getenv("SOTC_DMA_INCR");
+            return !(v && v[0] == '0');
+        }();
+        if (!dma_incr || std::exchange(dma_full_pending, false)) {
+            if (dma_incr) {
+                memory_tracker->ForEachSweepSpan([](VAddr, u64) {});
+            }
+            // sotc: by index with a copied entry, re-reading size(): nothing nested in
+            // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
+            for (size_t i = 0; i < dma_runs.size(); ++i) {
+                const auto [device_addr, size] = dma_runs[i];
+                SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
+                                  static_cast<u32>(size), false, false);
+            }
+            ranges = dma_runs_ranges;
+        } else {
+            dma_spans.clear();
+            memory_tracker->ForEachSweepSpan(
+                [this](VAddr address, u64 size) { dma_spans.emplace_back(address, size); });
+            std::ranges::sort(dma_spans);
+            size_t s = 0;
+            for (size_t i = 0; i < dma_runs.size() && s < dma_spans.size(); ++i) {
+                const auto [run_start, run_size] = dma_runs[i];
+                const VAddr run_end = run_start + run_size;
+                while (s < dma_spans.size() &&
+                       dma_spans[s].first + dma_spans[s].second <= run_start) {
+                    ++s;
+                }
+                VAddr lo = ~0ULL;
+                VAddr hi = 0;
+                for (size_t k = s; k < dma_spans.size() && dma_spans[k].first < run_end; ++k) {
+                    lo = std::min(lo, std::max(run_start, dma_spans[k].first));
+                    hi = std::max(hi, std::min(run_end, dma_spans[k].first + dma_spans[k].second));
+                }
+                if (lo < hi) {
+                    SynchronizeMemory(address_space[run_start >> ARENA_PAGE_BITS], lo,
+                                      static_cast<u32>(hi - lo), false, false);
+                    ++ranges;
+                }
+            }
         }
-        ranges = dma_runs_ranges;
         SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
     } else {
         for (const auto& range : resident_ranges) {
@@ -1332,8 +1453,11 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     });
     resident_ranges.Subtract(first_block, end_block);
     ++resident_version; // sotc: invalidates the merged DMA runs
-    gpu_modified_ranges.Subtract(first_block << block_shift,
-                                 (end_block - first_block) << block_shift);
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(first_block << block_shift,
+                                     (end_block - first_block) << block_shift);
+    }
     // sotc: a bind of the same blocks (the guest maps them again) must not share the unbind's
     // sparse bind batch: binds of one range within a batch are not ordered (the evicted blocks
     // of MaybeEvictCold came back unbound: black scenes).

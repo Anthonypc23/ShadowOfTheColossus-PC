@@ -6,6 +6,7 @@
 #include <array>
 
 #include <chrono>
+#include <shared_mutex>
 #include <deque>
 #include <span>
 #include <vector>
@@ -175,6 +176,10 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// sotc: the range [first, second) of the arena that a readback of [device_addr, +size)
+    /// downloads and unmarks as GPU-modified: 512 KiB around it, smaller with SOTC_RB_NARROW.
+    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size);
+
     /// One range to read back: its GPU-modified parts, as copies from the arena.
     struct ReadbackItem {
         const Buffer* arena;
@@ -242,6 +247,9 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see
+    /// Liverpool::IsBackThreaded) and read by the command processor's SRT walkers (ReadClean).
+    std::shared_mutex gpu_modified_mutex;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
@@ -280,6 +288,8 @@ private:
     /// sotc (SOTC_DMA_MERGE): touching resident ranges whose start lies in the same arena,
     /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
     std::vector<std::pair<VAddr, u64>> dma_runs;
+    bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
+    std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;
@@ -287,6 +297,8 @@ private:
         std::chrono::steady_clock::time_point last_request;
     };
     static constexpr size_t MaxHotReadbacks = 64;
+    /// sotc: the SOTC_RB_NARROW readback window in bytes, 0 for the 512 KiB one (ReadbackWindow).
+    u64 rb_narrow_window{};
     static constexpr auto HotReadbackLifetime = std::chrono::seconds(2);
     std::vector<HotReadback> hot_readbacks;
     /// sotc: pages the guest read back recently (the faulting ranges, not the windows). A GPU

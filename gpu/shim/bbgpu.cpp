@@ -301,7 +301,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
-    const std::string title = config->title ? config->title : "Bloodborne";
+    const std::string title = config->title ? config->title : "Shadow of the Colossus";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
@@ -360,9 +360,7 @@ extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
 
 extern "C" int bbgpu_is_gpu_side_thread(void) {
     auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
-    return rasterizer && std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread()
-               ? 1
-               : 0;
+    return rasterizer && rasterizer->IsGpuSideThread() ? 1 : 0;
 }
 
 extern "C" void bbgpu_register_guest_stack(uintptr_t address, uint64_t size) {

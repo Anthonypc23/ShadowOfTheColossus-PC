@@ -282,7 +282,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    // sotc: 40, room for the frame generation extensions (SOTC_FG).
+    boost::container::static_vector<const char*, 40> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -415,6 +416,69 @@ bool Instance::CreateDevice() {
         const auto fault_features = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>();
         device_fault = fault_features.deviceFault;
         device_fault_vendor_binary = fault_features.deviceFaultVendorBinary;
+    }
+
+    // sotc: frame generation (SOTC_FG). Queried and enabled only when it is on, so without it
+    // the device is created exactly as before.
+    const auto has_extension = [&](std::string_view extension) {
+        return std::find(available_extensions.begin(), available_extensions.end(), extension) !=
+               available_extensions.end();
+    };
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR fg_derivatives{};
+    vk::PhysicalDevicePresentIdFeaturesKHR fg_present_id{};
+    vk::PhysicalDevicePresentWaitFeaturesKHR fg_present_wait{};
+    if (EmulatorSettings.IsFrameGenEnabled()) {
+        const auto fg_chain = physical_device.getFeatures2<
+            vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
+            vk::PhysicalDevicePresentIdFeaturesKHR, vk::PhysicalDevicePresentWaitFeaturesKHR>();
+        const bool derivatives =
+            has_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) &&
+            fg_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>()
+                .computeDerivativeGroupLinear;
+        const bool without_format = features.shaderStorageImageReadWithoutFormat &&
+                                    features.shaderStorageImageWriteWithoutFormat;
+        constexpr auto fg_ops = vk::SubgroupFeatureFlagBits::eBasic |
+                                vk::SubgroupFeatureFlagBits::eArithmetic |
+                                vk::SubgroupFeatureFlagBits::eQuad;
+        const bool subgroup_ops =
+            (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
+            (vk11_props.subgroupSupportedOperations & fg_ops) == fg_ops;
+        // The embedded SPIR-V is the wave32 permutation. NVIDIA always runs 32 wide; devices
+        // with a wider range (AMD wave64, Intel SIMD16) must be able to require 32 for compute.
+        const bool fixed32 = vk13_props.minSubgroupSize == 32 && vk13_props.maxSubgroupSize == 32;
+        // vk13_features is only filled further down: read the queried chain.
+        const bool size_control =
+            feature_chain.get<vk::PhysicalDeviceVulkan13Features>().subgroupSizeControl;
+        const bool pin32 = !fixed32 && size_control &&
+                           (vk13_props.requiredSubgroupSizeStages &
+                            vk::ShaderStageFlagBits::eCompute) &&
+                           vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize >= 32;
+        frame_gen_supported = derivatives && without_format && subgroup_ops && (fixed32 || pin32);
+        frame_gen_subgroup_size = frame_gen_supported && pin32 ? 32u : 0u;
+        if (frame_gen_supported) {
+            add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+            fg_derivatives.computeDerivativeGroupLinear = vk::True;
+        }
+        // Optional: lets the present be waited for outside the queue lock (FIFO pacing).
+        present_wait = has_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+                       has_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) &&
+                       fg_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId &&
+                       fg_chain.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait;
+        if (present_wait) {
+            add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+            add_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+            fg_present_id.presentId = vk::True;
+            fg_present_wait.presentWait = vk::True;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Frame generation (SOTC_FG): {} - compute_shader_derivatives {}, storage "
+                 "images without format {}, compute subgroup quad/arithmetic {}, subgroup "
+                 "{}-{} ({}), present_wait {}",
+                 frame_gen_supported ? "supported" : "UNSUPPORTED, frames are shown as usual",
+                 derivatives, without_format, subgroup_ops, vk13_props.minSubgroupSize,
+                 vk13_props.maxSubgroupSize,
+                 fixed32 ? "fixed 32" : (pin32 ? "pinned to 32" : "cannot require 32"),
+                 present_wait);
     }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
@@ -652,6 +716,20 @@ bool Instance::CreateDevice() {
         fault_features.pNext = features2.pNext;
         features2.pNext = &fault_features;
     }
+    // sotc: frame generation features, chained the same way (only set with SOTC_FG).
+    if (frame_gen_supported) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        features2.features.shaderStorageImageReadWithoutFormat = vk::True;
+        features2.features.shaderStorageImageWriteWithoutFormat = vk::True;
+        fg_derivatives.pNext = features2.pNext;
+        features2.pNext = &fg_derivatives;
+    }
+    if (present_wait) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        fg_present_id.pNext = &fg_present_wait;
+        fg_present_wait.pNext = features2.pNext;
+        features2.pNext = &fg_present_id;
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -733,6 +811,8 @@ void Instance::CreateAllocator() {
         },
     };
     const VmaAllocatorCreateInfo allocator_info = {
+        // The driver's budget counts the buffer arena memory allocated outside VMA, so images
+        // stop filling the VRAM the arena still needs and spill to system memory instead
         .flags = static_cast<VmaAllocatorCreateFlags>(
             VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
             (supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0)),

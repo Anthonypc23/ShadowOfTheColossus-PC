@@ -5,10 +5,10 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -22,6 +22,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_stats.h"
 
@@ -81,6 +82,15 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
 
+// sotc: see SubmitFlipInternal. SOTC_EARLY_VO_LABEL=0 restores the upstream behaviour.
+static bool EarlyVoLabel() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_EARLY_VO_LABEL");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
     case PixelFormat::A8R8G8B8Srgb:
@@ -129,6 +139,7 @@ void VideoOutDriver::Close(s32 handle) {
     main_port.is_open = false;
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
+    main_port.submit_prev_index = -1;
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
@@ -302,11 +313,17 @@ extern "C" uint64_t runtime_memory_carve_splits(void);
 extern "C" uint64_t runtime_file_read_ns_take(void);
 
 void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
+    if (auto* pacer = presenter->Pacer()) {
+        // sotc: SOTC_FG: the frame pacer thread presents (vk_frame_pacer.h); this thread keeps
+        // the guest half of the flip (stats, flip status, events, label).
+        pacer->Enqueue(req.frame, req.port->is_hdr);
+    } else {
+        // Update HDR status before presenting.
+        presenter->SetHDR(req.port->is_hdr);
 
-    // Present the frame.
-    presenter->Present(req.frame);
+        // Present the frame.
+        presenter->Present(req.frame);
+    }
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
     const bool fps_log = SotcStats::kFpsLog; // sotc: the switch the counters use (sotc_stats.h)
@@ -347,8 +364,8 @@ void VideoOutDriver::Flip(const Request& req) {
             }
         }
         if (now - window_start >= std::chrono::seconds(5)) {
-            std::string out; // sotc: written by the stats writer thread (WriteStatsAsync)
             const double seconds = std::chrono::duration<double>(now - window_start).count();
+            std::string out; // sotc: written by the stats writer thread (WriteStatsAsync)
             {
                 std::sort(frame_ms.begin(), frame_ms.end());
                 const auto pct = [&](double p) {
@@ -368,7 +385,7 @@ void VideoOutDriver::Flip(const Request& req) {
                     }
                     return text;
                 };
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC FRAMES p50 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
                              "[%s]; >50 ms: %u [%s]; compiled %llu\n",
                              pct(0.5), pct(0.99), 1000.0 / pct(0.99), worst_ms,
@@ -389,14 +406,14 @@ void VideoOutDriver::Flip(const Request& req) {
                     }
                 }
                 if (!allocs.empty()) {
-                    std::fprintf(stderr, "SOTC ALLOC %s\n", allocs.c_str());
+                    StatsPrintf(out, "SOTC ALLOC %s\n", allocs.c_str());
                 }
                 if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
                     const auto take = [](int i) {
                         return SotcStats::compile_phase_ns[i].exchange(0) / 1e6;
                     };
                     const double emit = take(1), patch = take(2), module = take(3), reg = take(4);
-                    std::fprintf(stderr,
+                    StatsPrintf(out,
                                  "SOTC COMPILE translate %.1f, emit %.1f, patch lookup %.1f, "
                                  "module %.1f, register %.1f ms\n",
                                  translate / 1e6, emit, patch, module, reg);
@@ -429,13 +446,24 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(copies),
                          static_cast<unsigned long long>(bytes_changed),
                          static_cast<unsigned long long>(bytes));
+            // sotc: SOTC_RB_NARROW: GPU-written pages that the wide readback window would have
+            // downloaded and unprotected (and the GPU protected again), left protected instead.
+            if (const uint64_t kib = SotcStats::rb_narrow_kib.load(std::memory_order_relaxed)) {
+                StatsPrintf(out,
+                             "SOTC RB narrow %llu KiB windows: %.0f KiB/s of GPU-written pages "
+                             "left protected, %llu hot readbacks\n",
+                             static_cast<unsigned long long>(kib),
+                             SotcStats::rb_narrow_kept_bytes.exchange(0) / 1024.0 / seconds,
+                             static_cast<unsigned long long>(
+                                 SotcStats::rb_hot_entries.load(std::memory_order_relaxed)));
+            }
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
                 const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);
                 const uint64_t runs = SotcStats::dma_sweep_runs.exchange(0);
                 const uint64_t sweep_ns = SotcStats::dma_sweep_ns.exchange(0);
                 const uint64_t idle_ns = SotcStats::dma_sweep_idle_ns.exchange(0);
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC DMA sweeps %.0f/s, %.1f ranges each (%.1f runs), %.0f/s "
                              "uploading; %.1f ms/s (%.1f in sweeps that uploaded nothing)\n",
                              sweeps / seconds, double(ranges) / sweeps, double(runs) / sweeps,
@@ -446,7 +474,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 const auto mib = [](const std::atomic<uint64_t>& v) {
                     return static_cast<unsigned long long>(v.load(std::memory_order_relaxed) >> 20);
                 };
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC IMAGES %llu: gpu-written tiled %llu MiB, linear %llu MiB; "
                              "sampled streamed %llu MiB, other %llu MiB; below base mip %llu MiB, "
                              "below min_lod %llu MiB; live %llu MiB\n",
@@ -483,7 +511,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t reg_spins = SotcStats::stack_reg_spins.exchange(0);
             const uint64_t carves = runtime_memory_carve_splits();
             if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC fault grace: marks %llu, cap hits %llu, hot uploads %llu KiB; "
                              "stack registry spins %llu; live view splits %llu\n",
                              static_cast<unsigned long long>(grace_marks),
@@ -495,7 +523,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t repairs = SotcStats::desync_repairs.exchange(0);
             const uint64_t legit = SotcStats::desync_legit.exchange(0);
             if (repairs || legit) {
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC page tracking desync repairs %llu (repeated faults left alone "
                              "%llu)\n",
                              static_cast<unsigned long long>(repairs),
@@ -504,7 +532,7 @@ void VideoOutDriver::Flip(const Request& req) {
             // sotc: video memory against the budget the texture cache collects for; emergency
             // collections mean an allocation already failed (6 GB cards in large areas).
             if (const uint64_t budget = SotcStats::vram_budget.load(std::memory_order_relaxed)) {
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC VRAM %llu/%llu MiB (VMA blocks %llu MiB holding %llu MiB, "
                              "buffer arenas %llu MiB, images %llu MiB in "
                              "%llu; GC freed %llu, kept tiled %llu), emergency collections %llu\n",
@@ -527,11 +555,20 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::vram_emergency.exchange(0)));
             }
+            if (const uint64_t waits = SotcStats::cp_waits.exchange(0)) {
+                StatsPrintf(out, "SOTC CP waits for the draw thread %.0f/s\n", waits / seconds);
+            }
+            if (flips) {
+                const double idle_ms = SotcStats::draw_idle_ns.exchange(0) / 1e6;
+                const double parse_ms = SotcStats::cp_parse_ns.exchange(0) / 1e6;
+                StatsPrintf(out, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
+                             (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
+            }
             // sotc: write-fault readbacks whose pages were still GPU-modified (totals).
             if (const uint64_t pending = SotcStats::write_fault_gpu_pending.load(),
                 stale = SotcStats::write_fault_stale_gpu.load();
                 pending || stale) {
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC write faults over GPU data: left protected %llu, stale page "
                              "bits cleared %llu\n",
                              static_cast<unsigned long long>(pending),
@@ -574,7 +611,7 @@ void VideoOutDriver::Flip(const Request& req) {
                              double(SotcStats::uploads.exchange(0)) / flips,
                              double(SotcStats::upload_bytes.exchange(0)) / 1024.0 / flips,
                              double(SotcStats::render_breaks.exchange(0)) / flips);
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC sys/frame: protects %.0f (%.0f writable, %.0f KB), "
                              "texture cache locks %.0f (%.0f contended, %.3f ms waiting), vk allocs %.1f, frees %.1f; protects from images %.0f, "
                              "buffers %.0f; invalidated KB: map %.0f, mprotect %.0f, hle %.0f, "
@@ -593,6 +630,9 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::inv_protect.exchange(0) / 1024.0 / flips,
                              SotcStats::inv_hle.exchange(0) / 1024.0 / flips,
                              SotcStats::inv_buffer.exchange(0) / 1024.0 / flips);
+            }
+            if (auto* pacer = presenter->Pacer()) {
+                out += pacer->TakeStats(seconds); // sotc: SOTC_FG
             }
             WriteStatsAsync(std::move(out));
             flips = 0;
@@ -629,7 +669,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
 
     // Reset prev flip label
-    if (port->prev_index != -1) {
+    if (!EarlyVoLabel() && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -638,11 +678,18 @@ void VideoOutDriver::Flip(const Request& req) {
 }
 
 void VideoOutDriver::DrawBlankFrame() {
+    if (auto* pacer = presenter->Pacer()) {
+        pacer->RequestBlank(); // sotc: SOTC_FG, the pacer owns the present scheduler
+        return;
+    }
     const auto empty_frame = presenter->PrepareBlankFrame(true);
     presenter->Present(empty_frame, false, false);
 }
 
 void VideoOutDriver::DrawLastFrame() {
+    if (presenter->Pacer()) {
+        return; // sotc: SOTC_FG, FIFO keeps the last frame on screen
+    }
     const auto frame = presenter->PrepareLastFrame();
     if (frame != nullptr) {
         presenter->Present(frame, true);
@@ -667,7 +714,8 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendOrderedCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
     } else {
         SubmitFlipInternal(port, index, flip_arg, is_eop);
     }
@@ -684,6 +732,19 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+    }
+
+    // sotc: the buffer shown before this flip is free once the copy of this one is recorded:
+    // PrepareFrame read it on the GPU timeline, ahead of anything the game renders into the old
+    // buffer next. Upstream frees it only when the present thread takes this flip on a vblank
+    // tick, and the command processor waits for that in the VO label wait at the start of the
+    // next frame.
+    if (EarlyVoLabel()) {
+        if (port->submit_prev_index != -1) {
+            port->buffer_labels[port->submit_prev_index] = 0;
+            port->SignalVoLabel();
+        }
+        port->submit_prev_index = index;
     }
 
     std::scoped_lock lock{mutex};
@@ -716,6 +777,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     };
 
     while (!token.stop_requested()) {
+        // sotc: SOTC_FG: the guest vblank may follow the display's measured refresh, so real
+        // frames do not drift against the screen (FramePacer::GuestVblankPeriod).
+        if (auto* pacer = presenter->Pacer()) {
+            timer.SetTargetInterval(pacer->GuestVblankPeriod(vblank_period));
+        }
         timer.Start();
 
         if (DebugState.IsGuestThreadsPaused()) {

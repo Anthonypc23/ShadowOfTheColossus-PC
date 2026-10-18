@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.57
+# Shadow of the Colossus — PC (port nativo / native port) · v0.66-cp-mt
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,19 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.66-cp-mt** | **Geração de quadros FSR 3** (experimental, opção no lançador): no modo 30 FPS a tela mostra 60, sem tirar FPS do jogo. |
+| 0.65-cp-mt | **+4% de FPS** (janela de readback menor; Santuário 46 → 48 FPS). Opção "Sombras do sol" no lançador (desligada: +6% FPS, sem sombras do sol). Lançador não fecha mais quando o console recusa escrita. |
+| **0.64-cp-mt** | **+10% de FPS** (build com PGO; Santuário 41 → 45 FPS). |
+| **0.63-cp-mt** | **Primeira visita a cada área bem mais lisa** (tradução de shaders 15,6 → 3,0 s por sessão; travada ao carregar o save 7,8 → 1,4 s). |
+| **0.62-cp-mt** | **Fim do solavanco a cada 5 s** com "mostrar FPS" ligado (pior quadro ~125 → ~34 ms). |
+| **0.61-cp-mt** | **Modo PS4 Pro muito mais rápido** (cena pós-colosso: cinemático 22,5 → 39,3 FPS). |
+| **0.60-cp-mt** | Integra a fork de Oussama268 (0.57-opt5) e corrige duas corridas no cache de texturas. |
+| **0.59-cp-mt** | **Modo PS4 Pro:** fim do crash ao carregar o save e da tela preta ao desligar o Pro. |
+| **0.58-cp-mt** | **Processador de comandos em duas threads** (Santuário ~29 → ~40 FPS). |
+| **0.57-opt5** | **Sessões longas estáveis:** memória de buffers sem uso devolvida à GPU (30 minutos de demo: pico 3,4 GB estável, antes 4,3–4,4 GB e subindo). **Mundo aberto ~2% mais rápido** (envio antecipado). **Correção de queda rara** ao carregar o save ("write-only"). |
+| **0.57-opt4** | **Mais FPS:** a thread de comandos gasta bem menos tempo em travas, proteções de página, cópias e alocações (santuário 29 → 35 FPS; demo 47 → 53,5 FPS, 1% low 29 → 38, quadros acima de 50 ms 129 → 26). |
+| **0.57-opt3** | **Menos travadas na primeira visita a uma área:** pipelines gráficos montados em segundo plano; o objeto novo aparece um instante depois em vez de o jogo parar (cache vazio: 1% low 23,9 → 29,1 FPS, quadros acima de 50 ms 235 → 156). |
+| **0.57-opt2** | **Muito menos engasgos (placas de 6 GB):** texturas guardam só os mips usados (memória de vídeo no demo ~6,1 → ~3,4 GB). **Leituras da GPU assíncronas** (santuário 29 → 31 FPS). **Memória de buffers devolvida** ao desmapear (sessões longas). Demo: 49,9 FPS, 47 quadros acima de 50 ms (antes 100–150). **Quedas deixam log e minidump** em `user/crashes/`. |
 | **0.57** | **Placas AMD:** correção das cores verdes/rosas na névoa e nos personagens (as AMD passam a usar o caminho de 32 threads da NVIDIA; diagnóstico da issue #7, ainda não testado numa AMD). **Opção nova** no lançador para desligar o acesso direto à memória: ~10% mais FPS, água distante mais lisa. |
 | **0.56** | **Água do mundo aberto com ondas:** lagos e rios abaixo das cascatas não ficam mais lisos como espelho (uma instrução de shader, `S_WQM_B64`, era ignorada). **Lago de cima ondula e reflete até longe** (acesso direto à memória ligado por padrão, como no Pink-shadPS4). Árvores distantes sem "lixo colorido". |
 | **0.0.13** | **Sem quedas:** corrigida a queda na abertura/menu da 0.0.12 (o jogo pedia mais texturas do que cabe no pool). Testado ~40 min pelo mapa, com dois carregamentos de save. **Reflexos do lago** em quase toda a superfície, com ondulação (uma trava de laços dos shaders cortava os raios do reflexo). |
@@ -116,6 +129,19 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.66-cp-mt** | **FSR 3 frame generation** (experimental, launcher option): in 30 FPS mode the screen shows 60, with no FPS taken from the game. |
+| 0.65-cp-mt | **+4% FPS** (smaller readback window; Shrine 46 → 48 FPS). "Sun shadows" launcher option (off: +6% FPS, no sun shadows). Launcher no longer quits when the console refuses writes. |
+| **0.64-cp-mt** | **+10% FPS** (PGO build; Shrine 41 → 45 FPS). |
+| **0.63-cp-mt** | **Much smoother first visit to each area** (shader translation 15.6 → 3.0 s per session; save-load stall 7.8 → 1.4 s). |
+| **0.62-cp-mt** | **No more hitch every 5 s** with the FPS display on (worst frame ~125 → ~34 ms). |
+| **0.61-cp-mt** | **PS4 Pro mode much faster** (post-colossus scene: cinematic 22.5 → 39.3 FPS). |
+| **0.60-cp-mt** | Merges Oussama268's fork (0.57-opt5) and fixes two texture-cache races. |
+| **0.59-cp-mt** | **PS4 Pro mode:** no more crash when the save loads, no black picture after turning Pro off. |
+| **0.58-cp-mt** | **Command processor on two threads** (Shrine ~29 → ~40 FPS). |
+| **0.57-opt5** | **Stable long sessions:** unused buffer memory is given back to the GPU (30-minute demo: peak 3.4 GB and flat, before 4.3–4.4 GB and rising). **Open world ~2% faster** (early submit). **Fix for a rare crash** while loading the save ("write-only"). |
+| **0.57-opt4** | **More FPS:** the command thread spends far less time in locks, page protection, copies and allocations (shrine 29 → 35 FPS; demo 47 → 53.5 FPS, 1% low 29 → 38, frames over 50 ms 129 → 26). |
+| **0.57-opt3** | **Less freezing on the first visit to an area:** graphics pipelines are built in the background; a new object appears a moment later instead of the game stopping (empty cache: 1% low 23.9 → 29.1 FPS, frames over 50 ms 235 → 156). |
+| **0.57-opt2** | **Much less stutter (6 GB cards):** textures keep only the mips they use (video memory in the demo ~6.1 → ~3.4 GB). **Asynchronous GPU readbacks** (shrine 29 → 31 FPS). **Buffer memory given back** on unmap (long sessions). Demo: 49.9 FPS, 47 frames over 50 ms (before 100–150). **Crashes leave a log and a minidump** in `user/crashes/`. |
 | **0.57** | **AMD cards:** fix for the green/pink fog and characters (AMD now uses the NVIDIA 32-lane path; diagnosis from issue #7, not yet tested on an AMD card). **New launcher option** to turn off direct memory access: ~10% more FPS, flatter distant water. |
 | **0.56** | **Open-world water with waves:** lakes and rivers below the waterfalls are no longer flat as a mirror (a shader instruction, `S_WQM_B64`, was ignored). **The upper lake ripples and reflects far away** (direct memory access on by default, as in Pink-shadPS4). Distant trees without "colored garbage". |
 | **0.0.13** | **No more crashes:** fixed the 0.0.12 crash in the intro/menu (the game asked for more textures than its pool holds). Tested ~40 min across the map with two save loads. **Lake reflections** over almost the whole surface, with ripples (a shader loop guard cut the reflection rays short). |
