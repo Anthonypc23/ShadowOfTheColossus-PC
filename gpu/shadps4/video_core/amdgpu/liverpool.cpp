@@ -113,6 +113,9 @@ static inline void CpuRelax() {
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
     Shader::g_info_slot = 1;
+#ifdef __linux__
+    back_tid = gettid();
+#endif
     u64 tail = back_tail.load(std::memory_order_relaxed);
     while (!stoken.stop_requested()) {
         if (num_commands.load(std::memory_order_acquire)) {
@@ -332,7 +335,9 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
         return;
     }
     WaitBackWrites();
-    const auto* pipeline = rasterizer->LookupGraphicsPipeline(0, 0);
+    // sotc: no pipeline for a draw FilterDraw drops on the draw thread (review of #99).
+    const auto* pipeline =
+        rasterizer->IsDrawFilteredOut() ? nullptr : rasterizer->LookupGraphicsPipeline(0, 0);
     BackOp& op = BackAlloc();
     op.kind = BackOp::Kind::Draw;
     op.is_indexed = is_indexed;
@@ -350,8 +355,10 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
         return;
     }
     WaitBackWrites();
-    const auto* pipeline =
-        rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset, instance_sgpr_offset);
+    const auto* pipeline = rasterizer->IsDrawFilteredOut()
+                               ? nullptr
+                               : rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset,
+                                                                    instance_sgpr_offset);
     BackOp& op = BackAlloc();
     op.kind = BackOp::Kind::DrawIndirect;
     op.is_indexed = is_indexed;
@@ -1319,7 +1326,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
-                WaitBackWrites();
+                // sotc: the predicate may be written by a queued fence (EOP/EOS/ReleaseMem write
+                // from the CPU side, not counted by WaitBackWrites) or by a dispatch not recorded
+                // yet (its output not protected yet): the draw thread must have run them. Rare.
+                DrainBack();
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     SotcStats::Drop(4, reinterpret_cast<uintptr_t>(cond_exec->Address()),

@@ -237,13 +237,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
-    // sotc: SOTC_RB_ASYNC=1: with the draw thread (Liverpool::IsBackThreaded) the synchronous
-    // readback holds it while the GPU catches up (~10% of its time; Shrine 38.9 -> 40.6 fps). Off
-    // by default: the attract demo of another branch (DUDUYG, PR 69) and one boot of this one
-    // stopped on the page_manager.cpp "protect region as write-only" assertion with it.
-    static const bool async = [this] {
+    // sotc: asynchronous readbacks by default (SOTC_RB_ASYNC=0: the waiting thread waits). With
+    // the draw thread (Liverpool::IsBackThreaded) the synchronous readback holds it while the GPU
+    // catches up (~10% of its time): Shrine 34.6 -> 37.0 FPS. #99 had made it opt-in after the
+    // "protect region as write-only" assertion; MarkWrittenByGuest (fork PR #31) removes that
+    // cause, and SignalImpl::Protect no longer stops the game on it.
+    static const bool async = [] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));
@@ -386,13 +387,10 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     } else {
         download.buffer->Invalidate(download.offset, download.size);
-        for (const auto& item : readback.pending) {
-            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-            for (const auto& [address, range_size] : item.gpu_ranges) {
-                gpu_modified_ranges.Subtract(address, range_size);
-            }
-        }
+        // sotc: the ranges leave the GPU-modified set only once the backing holds their data:
+        // the command processor's clean reads (ReadClean) would read the stale backing before.
         ApplyDownloads(readback.pending, download.mapped, download.offset);
+        SubtractDownloaded(readback.pending);
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
@@ -480,6 +478,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // headers are followed through the physical chain on every write anyway. Only the command
     // processor thread downloads memory.
     ApplyDownloads(pending, download.mapped, download.offset);
+    SubtractDownloaded(pending); // sotc: after the backing holds the data (see FinishAsyncReadback)
+}
+
+void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
+    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+    for (const auto& item : items) {
+        for (const auto& [address, range_size] : item.gpu_ranges) {
+            gpu_modified_ranges.Subtract(address, range_size);
+        }
+    }
 }
 
 u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
@@ -571,14 +579,12 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                         });
                 };
                 gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
-                if (subtract) {
-                    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-                    gpu_modified_ranges.Subtract(address, range_size);
-                } else {
-                    item.gpu_ranges.emplace_back(address, range_size);
-                }
+                item.gpu_ranges.emplace_back(address, range_size);
             });
         if (item.copies.empty()) {
+            if (subtract) {
+                SubtractDownloaded({&item, 1}); // nothing bound to read back
+            }
             continue;
         }
         // Large modified regions (render targets and the like) are left to their own readback.
@@ -588,12 +594,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
             item_bytes += copy.size;
         }
         if (hot_mode == 1 && !pending.empty() && item_bytes > MaxHotBytes) {
-            // Not downloaded now: give the range back to the modified set.
-            for (const auto& copy : item.copies) {
-                if (subtract) {
-                    AddGpuModified(arena_base + copy.srcOffset, copy.size);
-                }
-            }
+            // Not downloaded now: its ranges stay in the modified set.
             total_size_bytes = total_before;
             continue;
         }
@@ -922,7 +923,11 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     if (foreign) {
         return false;
     }
-    gpu_modified_ranges.Subtract(addr, size);
+    {
+        // sotc: the command processor reads the set under the shared lock (ReadClean).
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
