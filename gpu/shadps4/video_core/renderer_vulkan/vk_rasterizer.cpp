@@ -69,6 +69,36 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
 Rasterizer::~Rasterizer() = default;
 
+// Games may disable color buffer and enable force depth/stencil dirty and valid to do a copy from
+// one depth-stencil surface to another, without a pixel shader: {depth copy, stencil copy}.
+static std::pair<bool, bool> DepthStencilOverrideCopy(const auto& regs) {
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        return {false, false};
+    }
+    const bool depth_copy =
+        regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
+        regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
+        regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
+    const bool stencil_copy =
+        regs.depth_render_override.force_stencil_dirty &&
+        regs.depth_render_override.force_stencil_valid && regs.depth_buffer.StencilValid() &&
+        regs.depth_buffer.StencilWriteValid() &&
+        regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
+    return {depth_copy, stencil_copy};
+}
+
+bool Rasterizer::IsDrawFilteredOut() const {
+    const auto& regs = liverpool->DrawRegs();
+    using Mode = AmdGpu::ColorControl::OperationMode;
+    const auto mode = regs.color_control.mode;
+    if (mode == Mode::EliminateFastClear || mode == Mode::FmaskDecompress ||
+        mode == Mode::Resolve || regs.primitive_type == AmdGpu::PrimitiveType::None) {
+        return true;
+    }
+    const auto [depth_copy, stencil_copy] = DepthStencilOverrideCopy(regs);
+    return depth_copy || stencil_copy;
+}
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->DrawRegs();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
@@ -93,20 +123,8 @@ bool Rasterizer::FilterDraw() {
         return false;
     }
 
-    const bool cb_disabled =
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
-    const auto depth_copy =
-        regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
-        regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
-        regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
-    const auto stencil_copy =
-        regs.depth_render_override.force_stencil_dirty &&
-        regs.depth_render_override.force_stencil_valid && regs.depth_buffer.StencilValid() &&
-        regs.depth_buffer.StencilWriteValid() &&
-        regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
-    if (cb_disabled && (depth_copy || stencil_copy)) {
-        // Games may disable color buffer and enable force depth/stencil dirty and valid to
-        // do a copy from one depth-stencil surface to another, without a pixel shader.
+    const auto [depth_copy, stencil_copy] = DepthStencilOverrideCopy(regs);
+    if (depth_copy || stencil_copy) {
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
         DepthStencilCopy(depth_copy, stencil_copy);
@@ -535,7 +553,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
@@ -577,7 +595,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
@@ -1899,7 +1917,10 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         return !v || v[0] != '0';
     }();
     if (release_enabled) {
-        liverpool->SendCommand<false>(
+        // sotc: ordered at the command processor's point of the stream: with the draw thread a
+        // guest-thread command would run ahead of the draws already queued, which may still use
+        // the range (review of #99).
+        liverpool->SendOrderedCommand(
             [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });
     }
     texture_cache.UnmapMemory(addr, size);
@@ -2267,6 +2288,10 @@ std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
 #ifdef __linux__
 u32 Rasterizer::GetGpuCommandProcessorThreadId() {
     return liverpool->GetGpuCommandProcessorThreadId();
+}
+
+bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+    return liverpool->IsGpuSideThreadId(tid);
 }
 #endif
 

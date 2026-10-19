@@ -55,6 +55,18 @@ struct Program {
     Shader::Info info;
     ModuleList modules{};
 
+    /// sotc: the permutation GetProgram found last time. The same user data, flat buffer,
+    /// runtime info and start bindings make the same specialization: the lookup is skipped.
+    struct LastLookup {
+        bool valid{};
+        std::vector<u32> user_data;
+        std::vector<u32> flat;
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        Shader::Backend::Bindings end{};
+        size_t perm_idx{};
+    } last;
+
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
@@ -130,9 +142,12 @@ private:
 
     /// sotc: SOTC_ASYNC_SHADERS (default on): a new graphics pipeline is built on a worker
     /// thread, and the draws that need it are skipped until it is ready (GetGraphicsPipeline
-    /// returns nullptr meanwhile; its map entry stays null while pending). Compute pipelines are
-    /// still built synchronously (the game reads compute results back).
+    /// returns nullptr meanwhile; its map entry stays null while pending). Compute dispatches are
+    /// never skipped (the game reads compute results back): with SOTC_ASYNC_COMPUTE (default on)
+    /// a new compute pipeline is built by a worker ahead of the graphics jobs, and the recording
+    /// thread waits for it when it binds it (ComputePipeline::BindWhenReady).
     struct AsyncPipelineJob {
+        ComputePipeline* compute{}; ///< a compute job: only Build() is run
         GraphicsPipelineKey key;
         u64 hash{};
         std::array<const Shader::Info*, MaxShaderStages> infos{};
@@ -181,6 +196,7 @@ private:
     std::mutex async_mutex;
     std::condition_variable_any async_cv;
     std::deque<std::unique_ptr<AsyncPipelineJob>> async_queue;
+    size_t async_compute_queued{}; ///< compute jobs at the head of async_queue, oldest first
     std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;
     std::atomic<u32> async_done_count{0};
     std::vector<std::jthread> async_workers;
