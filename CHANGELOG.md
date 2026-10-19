@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.66-opt6 — 2026-10-18 (fork Anthonypc23)
+- **Tela cheia a 60 Hz** quando a taxa da área de trabalho não é múltipla de 60 (monitores de
+  74/75/144 Hz): cada quadro fica o mesmo número de atualizações na tela. `BB_FULLSCREEN_HZ=<Hz>`
+  escolhe a taxa; `BB_FULLSCREEN_HZ=0` mantém a da área de trabalho.
+- Integra o `main` da fork de Oussama268 (0.57-opt6): correções da thread de desenho do #99,
+  pipelines de compute nas threads de compilação (`SOTC_ASYNC_COMPUTE`), mais threads de
+  compilação, leituras do SRT walker que leem zero uma vez em vez de remendar o código. O
+  atualizador do lançador procura os releases deste fork.
+- Três commits da fork de MMadmer: trava de região com preferência para leitores no Windows (corrige
+  um deadlock), a thread de gravação dorme 2 ms em vez de girar a 100% de um núcleo, memo da busca
+  de programas.
+- Medido num Ryzen 5 5600GT + RTX 5060 (1080p, modo PS4 Pro + geração de quadros FSR 3): tela a
+  56 FPS de média; no templo o jogo fica em ~27 FPS (limite de CPU, >7000 draws por quadro).
+
 ## 0.66-cp-mt — 2026-10-18
 - **Geração de quadros FSR 3 (experimental):** nova opção no lançador (Gráficos > Resolução,
   "Geração de quadros FSR 3"; ou `SOTC_FG=1`). Cria um quadro intermediário entre cada par de
